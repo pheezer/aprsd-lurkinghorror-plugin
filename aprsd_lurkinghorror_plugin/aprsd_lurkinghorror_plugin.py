@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from aprsd import packets, plugin, threads
+from aprsd.threads import tx
 from aprsd.utils import trace
 from oslo_config import cfg
 
@@ -96,6 +97,50 @@ class GameIdleThread(threads.APRSDThread):
         GameSessionStore().save()
 
 
+class GameBeaconThread(threads.APRSDThread):
+    """Periodically beacon the service position with a themed comment/symbol.
+
+    aprsd's built-in beacon hardcodes its comment, so we send our own so the
+    game shows up on aprs.fi labeled as Lurking Horror.
+    """
+
+    def __init__(self):
+        super().__init__("LurkingHorrorBeacon")
+        self.period = max(60, CONF.lurking_horror.beacon_interval)
+        # Send one shortly after startup rather than waiting a full interval.
+        self._first = True
+
+    def loop(self) -> bool:
+        if self._first:
+            self._first = False
+        else:
+            slept = 0
+            while slept < self.period and not self._should_quit():
+                time.sleep(1)
+                slept += 1
+            if self._should_quit():
+                return False
+        self._send_beacon()
+        return True
+
+    def _send_beacon(self):
+        try:
+            pkt = packets.BeaconPacket(
+                from_call=CONF.callsign,
+                to_call="APRS",
+                latitude=float(CONF.lurking_horror.beacon_latitude),
+                longitude=float(CONF.lurking_horror.beacon_longitude),
+                comment=CONF.lurking_horror.beacon_comment,
+                symbol=CONF.lurking_horror.beacon_symbol,
+                symbol_table=CONF.lurking_horror.beacon_symbol_table,
+            )
+            pkt.retry_count = 1
+            tx.send(pkt)
+            LOG.info(f"Sent Lurking Horror beacon: {CONF.lurking_horror.beacon_comment}")
+        except Exception as ex:  # noqa: BLE001 - a beacon failure must never kill the thread/daemon
+            LOG.error(f"LurkingHorror beacon failed: {ex}")
+
+
 class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
     """Play Infocom's Lurking Horror (or any Z-machine game) over APRS."""
 
@@ -135,9 +180,23 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
         self.enabled = True
 
     def create_threads(self):
-        if self.enabled and CONF.lurking_horror.session_idle_timeout > 0:
-            return GameIdleThread()
-        return []
+        if not self.enabled:
+            return []
+        created = []
+        if CONF.lurking_horror.session_idle_timeout > 0:
+            created.append(GameIdleThread())
+        if (
+            CONF.lurking_horror.beacon_enabled
+            and CONF.lurking_horror.beacon_latitude is not None
+            and CONF.lurking_horror.beacon_longitude is not None
+        ):
+            created.append(GameBeaconThread())
+        elif CONF.lurking_horror.beacon_enabled:
+            LOG.warning(
+                "LurkingHorror beacon_enabled but beacon_latitude/longitude "
+                "not set; beacon disabled."
+            )
+        return created
 
     def help(self) -> str:
         p = self.prefix
