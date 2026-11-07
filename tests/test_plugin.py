@@ -1,0 +1,123 @@
+from unittest import mock
+
+import pytest
+
+from aprsd_lurkinghorror_plugin.aprsd_lurkinghorror_plugin import LurkingHorrorPlugin
+
+from .conftest import make_packet, requires_story
+
+pytestmark = pytest.mark.usefixtures("configured", "reset_session_store")
+
+
+def test_disabled_when_story_file_missing(configured):
+    configured.lurking_horror.story_file = "/nonexistent/story.z3"
+    plugin = LurkingHorrorPlugin()
+    assert plugin.enabled is False
+    # The base class reports the standard disabled message.
+    result = plugin.filter(make_packet("#"))
+    assert result == "LurkingHorrorPlugin isn't enabled"
+
+
+def test_alnum_prefix_builds_word_boundary_regex(configured):
+    configured.lurking_horror.command_prefix = "lh"
+    plugin = LurkingHorrorPlugin()
+    assert plugin.command_regex == r"^lh(\s|$)"
+
+
+@requires_story
+def test_non_prefixed_message_is_ignored(configured):
+    plugin = LurkingHorrorPlugin()
+    # No '#', so the command regex must not match -> plugin returns None and
+    # never collides with other command plugins.
+    assert plugin.filter(make_packet("go north")) is None
+
+
+@requires_story
+def test_help_meta_command(configured):
+    plugin = LurkingHorrorPlugin()
+    result = plugin.filter(make_packet("# help"))
+    assert isinstance(result, str)
+    assert "restart" in result.lower()
+
+
+@requires_story
+def test_new_game_intro_is_chunked(configured):
+    plugin = LurkingHorrorPlugin()
+    result = plugin.filter(make_packet("#"))
+    # The full intro is long; it is capped to max_reply_messages chunks, each
+    # within the APRS limit, with a truncation marker on the last one.
+    assert isinstance(result, list)
+    assert len(result) == configured.lurking_horror.max_reply_messages
+    assert all(len(chunk) <= 67 for chunk in result)
+    assert result[-1].endswith("(more)")
+    # The opening narration is what fits in the first chunk.
+    assert "waited until the last minute" in result[0]
+
+
+@requires_story
+def test_state_persists_between_messages(configured):
+    plugin = LurkingHorrorPlugin()
+    plugin.filter(make_packet("#"))  # start
+    plugin.filter(make_packet("# go south"))
+    result = plugin.filter(make_packet("# look"))
+    assert "Second Floor" in " ".join(
+        result if isinstance(result, list) else [result]
+    )
+
+
+@requires_story
+def test_restart_wipes_state(configured):
+    from aprsd_lurkinghorror_plugin.session import GameSessionStore
+
+    plugin = LurkingHorrorPlugin()
+    plugin.filter(make_packet("#"))
+    plugin.filter(make_packet("# go south"))
+    assert GameSessionStore().get_state("W1AW") is not None
+
+    # Restart wipes state and starts fresh; a follow-up look must show the
+    # opening Terminal Room again (not the Second Floor we moved to).
+    plugin.filter(make_packet("# restart"))
+    result = plugin.filter(make_packet("# look"))
+    assert "Terminal Room" in " ".join(
+        result if isinstance(result, list) else [result]
+    )
+
+
+@requires_story
+def test_players_have_independent_sessions(configured):
+    plugin = LurkingHorrorPlugin()
+    plugin.filter(make_packet("#", from_call="W1AW"))
+    plugin.filter(make_packet("# go south", from_call="W1AW"))
+    # A different callsign starting fresh has its own session: a look shows the
+    # opening Terminal Room, unaffected by W1AW moving to the Second Floor.
+    plugin.filter(make_packet("#", from_call="K6XYZ"))
+    result = plugin.filter(make_packet("# look", from_call="K6XYZ"))
+    assert "Terminal Room" in " ".join(
+        result if isinstance(result, list) else [result]
+    )
+    # And W1AW is still on the Second Floor.
+    w1aw = plugin.filter(make_packet("# look", from_call="W1AW"))
+    assert "Second Floor" in " ".join(w1aw if isinstance(w1aw, list) else [w1aw])
+
+
+def test_turn_timeout_returns_graceful_reply(configured):
+    plugin = LurkingHorrorPlugin()
+    plugin.enabled = True
+    # Force the guarded turn to time out without needing a real slow game.
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    with mock.patch.object(plugin, "_run_turn", side_effect=FutureTimeout):
+        result = plugin.filter(make_packet("# look"))
+    assert "timed out" in result.lower()
+
+
+def test_engine_error_returns_graceful_reply(configured):
+    from aprsd_lurkinghorror_plugin.engine import GameEngineError
+
+    plugin = LurkingHorrorPlugin()
+    plugin.enabled = True
+    with mock.patch.object(
+        plugin, "_run_turn", side_effect=GameEngineError("boom")
+    ):
+        result = plugin.filter(make_packet("# look"))
+    assert "game error" in result.lower()

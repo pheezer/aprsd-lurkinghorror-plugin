@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Tooling caches
+.tox/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Z-machine story files are NOT redistributable — never commit them.
+# The operator supplies their own copy; tests fetch one locally.
+tests/fixtures/*.z3
+tests/fixtures/*.z5
+tests/fixtures/*.z8
+tests/fixtures/*.dat
+*.sav

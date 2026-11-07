@@ -1,0 +1,639 @@
+from . import opcodes
+from .config import ZMachineConfig
+from .constants import ACTIVE_WINDOW_ID
+from .enums import OutputStreamType, PackedAddressType, RoutineType, StatusType
+from .error import *
+from .event import EventArgs, EventManager, MouseClickEventArgs, RoutineCallEventArgs
+from .logging import LogLevel, interpreter_logger, opcodes_logger
+from .memory import MemoryMap
+from .object_table import ObjectTable
+from .protocol import (
+    IInputSource,
+    IObjectTable,
+    IOutputStreamManager,
+    IQuetzal,
+    IScreen,
+)
+from .settings import RuntimeSettings
+from .stack import CallStack, EvalStack
+from .text import TextUtils
+from .undo import UndoStack
+
+
+class ZMachineInterpreter:
+    def __init__(self, 
+                 memory_map: MemoryMap,
+                 config: ZMachineConfig, 
+                 runtime_settings: RuntimeSettings,
+                 screen: IScreen,
+                 input_source: IInputSource,
+                 output_manager: IOutputStreamManager,
+                 quetzal: IQuetzal,
+                 event_manager: EventManager):
+        self.memory_map = memory_map
+        self.config = config
+        self.runtime_settings = runtime_settings
+        self._screen = screen
+        self.input_source = input_source
+        self.output_manager = output_manager
+        self.event_manager = event_manager
+        self.pc = self.config.initial_pc if self.version < 6 else 0
+        self.text_utils = TextUtils(memory_map, config)
+        self.quetzal = quetzal
+        self._object_table = ObjectTable(memory_map, config)
+        self.opcodes = opcodes.get_opcodes(self.version)
+        self.extended_opcodes = opcodes.get_extended_opcodes(self.version)
+        self.call_stack = self.init_call_stack()
+        self.undo_stack = UndoStack()
+        self.text_buffer = [0] * 240
+        self.quit = False
+        if self.version <= 3:
+            self.status_line_type = (self.read_byte(0x1) & 0x2) >> 1
+            self.event_manager.pre_read_input += self.pre_read_input_handler
+        if self.version >= 5 and runtime_settings.mouse_enabled:
+            # NOTE: the mouse click handler is a bit more defensive than the direct routine
+            # handler as the result is to write to dynamic memory.
+            self.event_manager.on_mouse_click += self.on_mouse_click_handler
+        self.event_manager.on_routine_call += self.on_routine_call_handler
+
+    @property
+    def version(self) -> int:
+        return self.config.version
+
+    @property
+    def object_table(self) -> IObjectTable:
+        return self._object_table
+    
+    @property
+    def screen(self) -> IScreen:
+        return self._screen
+    
+    def init_call_stack(self) -> CallStack:
+        if self.version < 6:
+            return CallStack()
+        result = CallStack(dummy_frame=False)
+        routine_addr = self.unpack_addr(self.config.initial_pc)
+        num_locals = self.read_byte(routine_addr)
+        result.push(
+            return_pc = 0,
+            store_varnum = 0,
+            local_vars = [0] * num_locals,
+            arg_count = 0,
+            routine_type = RoutineType.DISCARD
+        )
+        self.pc = routine_addr + 1
+        return result
+
+    def do_run(self):
+        try:
+            while not self.quit:
+                self.run_instruction()
+        except Exception as e:
+            print(e.__str__())
+        finally:
+            self.event_manager.on_quit.invoke(self, EventArgs())
+
+    def do_quit(self):
+        self.do_show_status()
+        self.quit = True
+
+    def do_verify(self) -> bool:
+        checksum = 0
+        with open(self.config.game_file, "rb") as s:
+            s.seek(0x40)
+            for _ in range(0x40, self.config.file_length):
+                checksum += int.from_bytes(s.read(1), "big")
+                checksum &= 0xffff
+        return checksum == self.config.checksum
+
+    def pre_read_input_handler(self, sender, e: EventArgs):
+        self.do_show_status()
+
+    def on_mouse_click_handler(self, sender, e: MouseClickEventArgs):
+        if self.config.header_extension_addr == 0:
+            return
+        self.memory_map.write_word(self.config.header_extension_addr + 2, e.x_coordinate + 1)
+        self.memory_map.write_word(self.config.header_extension_addr + 4, e.y_coordinate + 1)
+
+    def on_routine_call_handler(self, sender, e: RoutineCallEventArgs):
+        call_addr = self.unpack_addr(e.routine_addr)
+        self.do_direct_call(call_addr)
+
+    def do_show_status(self):
+        # In later versions, treat as a nop.
+        if self.version > 3:
+            return
+        location, status = self.get_status_strings()
+        self.screen.refresh_status_line(location, status)
+
+    def get_status_strings(self):
+        # This should be for version 3 only.
+        # In versions 4 and above, the game will handle the status line instructions.
+        location_id = self.get_global_var(0)
+        global1 = self.get_global_var(1)
+        global2 = self.get_global_var(2)
+        location = self.get_object_text(location_id)
+        # The status line should show score/moves or time, depending on bit 1 of flags1.
+        if self.status_line_type == StatusType.SCORE:
+            score, moves = ZMachineInterpreter.sign_uint16(global1), global2
+            right_status = f'Score: {score}'.ljust(16, ' ') + f'Moves: {moves}'.ljust(11, ' ')
+        else:
+            hours, minutes = global1, global2
+            meridian = 'AM' if hours < 12 else 'PM'
+            if hours == 0:
+                hours = 12
+            elif hours > 12:
+                hours -= 12
+            hh = str(hours).rjust(2, ' ')
+            right_status = f'Time: {hh}:{minutes:02} {meridian}'.ljust(17, ' ')
+        return location, right_status
+
+    def do_restart(self):
+        static_mem_ptr = self.config.static_memory_base_addr
+        with open(self.config.game_file, "rb") as s:
+            dynamic_mem = s.read(static_mem_ptr)
+            self.memory_map.reset_dynamic_memory(dynamic_mem)
+        self.pc = self.config.initial_pc if self.version < 6 else 0
+        self.call_stack = self.init_call_stack()
+        self.screen.reset_screen()
+
+    def do_save(self) -> bool:
+        return self.quetzal.do_save(self.pc, self.call_stack)
+
+    def do_restore(self) -> bool:
+        restored_pc, success = self.quetzal.do_restore(self.call_stack)
+        if success:
+            self.pc = restored_pc
+        return success
+
+    def do_save_undo(self):
+        call_stack_bytes = self.call_stack.serialize()
+        if len(call_stack_bytes) == 0:
+            self.do_store(0)
+            return
+        static_memory_base_addr = self.config.static_memory_base_addr
+        dynamic_memory = self.memory_map[:static_memory_base_addr]
+        self.undo_stack.push(dynamic_memory, call_stack_bytes, self.pc)
+        self.do_store(1)
+
+    def do_restore_undo(self):
+        frame = self.undo_stack.pop()
+        if frame is None:
+            self.do_store(0)
+            return
+        dynamic_mem = frame.dynamic_memory
+        call_stack_bytes = frame.call_stack_bytes
+        pc = frame.pc
+        self.memory_map.reset_dynamic_memory(dynamic_mem)
+        self.call_stack.deserialize(call_stack_bytes)
+        self.pc = pc
+        self.do_store(2)
+
+    def run_instruction(self):
+        def large_constant_operand():
+            return self.read_from_pc(2)
+
+        def small_constant_operand():
+            return self.read_from_pc()
+
+        def variable_operand():
+            varnum = self.read_from_pc()
+            return self.read_var(varnum)
+
+        instruction_ptr = self.pc
+        opcode = self.read_from_pc()
+        opcode_number = opcode
+        opcode_dict = self.opcodes
+        if opcode <= 0x7f:
+            # long form, 2OP
+            opcode_number = opcode & 0x1f
+            if opcode <= 0x1f:
+                operands = [small_constant_operand(), small_constant_operand()]
+            elif opcode <= 0x3f:
+                operands = [small_constant_operand(), variable_operand()]
+            elif opcode <= 0x5f:
+                operands = [variable_operand(), small_constant_operand()]
+            else:
+                operands = [variable_operand(), variable_operand()]
+        elif opcode <= 0xbf and opcode != 0xbe:
+            # short form, except 0xbe
+            opcode_number = (opcode & 0xf) | 0x80
+            if opcode <= 0x8f:
+                operands = [large_constant_operand()]
+            elif opcode <= 0x9f:
+                operands = [small_constant_operand()]
+            elif opcode <= 0xaf:
+                operands = [variable_operand()]
+            else:
+                operands = []
+                opcode_number = (opcode & 0xf) | 0xb0
+        else:
+            # variable form
+            operands = []
+            if opcode == 0xbe:
+                # Extended opcode, opcode number is in next byte.
+                opcode_number = self.read_from_pc()
+                opcode_dict = self.extended_opcodes
+            elif opcode <= 0xdf:
+                # 2OP form, opcode number is bottom 5 bits.
+                opcode_number = opcode & 0x1f
+            if opcode in (0xec, 0xfa):
+                # call_vn2 and call_vs2 have extra operands.
+                operand_bits = self.read_from_pc(2)
+                shift = 14
+            else:
+                operand_bits = self.read_from_pc()
+                shift = 6
+            while shift >= 0:
+                operand_type = (operand_bits >> shift) & 0x3
+                if operand_type == 0:
+                    operands += [large_constant_operand()]
+                elif operand_type == 1:
+                    operands += [small_constant_operand()]
+                elif operand_type == 2:
+                    operands += [variable_operand()]
+                else:
+                    break
+                shift -= 2
+        try:
+            if opcodes_logger.isEnabledFor(LogLevel.OPCODE):
+                opname = opcode_dict[opcode_number].__name__[3:].upper()
+                debug_msg = '{0:x}: {1}  {2}'.format(instruction_ptr, opname, ','.join([str(o) for o in operands]))
+                if opname.startswith('PRINT'):
+                    addr = 0
+                    if opname == 'PRINT_ADDR':
+                        addr = operands[0]
+                    elif opname == 'PRINT_PADDR':
+                        addr = self.unpack_addr(operands[0], PackedAddressType.STRING)
+                    elif opname in ('PRINT', 'PRINT_RET'):
+                        addr = self.pc
+                    if addr != 0:
+                        debug_msg += f' "{self.string_from_addr(addr)}"'
+                opcodes_logger.debug(debug_msg)
+            op = opcode_dict[opcode_number]
+            op(self, *operands)
+        except KeyError:
+            raise UnrecognizedOpcodeException(opcode_number, instruction_ptr)
+
+    @staticmethod
+    def sign_uint14(num: int) -> int:
+        # For branch offsets
+        if num >= 0x2000:
+            num = -(~num & 0x3fff) - 1
+        return num
+
+    @staticmethod
+    def sign_uint16(num: int) -> int:
+        if num >= 0x8000:
+            num = -(~num & 0xffff) - 1
+        return num
+    
+    @staticmethod
+    def sign_uint8(num: int) -> int:
+        # For sound effect arguments (volume and repeat may be negative)
+        if num >= 0x80:
+            num = -(~num & 0xff) - 1
+        return num
+
+    def read_from_pc(self, num_bytes=1):
+        result = 0
+        for _ in range(num_bytes):
+            result <<= 8
+            result |= self.read_byte(self.pc)
+            self.pc += 1
+        return result
+
+    def write_byte(self, addr: int, val: int):
+        self.memory_map.write_byte(addr, val)
+
+    def write_word(self, addr: int, val: int):
+        self.memory_map.write_word(addr, val)
+
+    def unpack_addr(self, packed_addr: int, addr_type: int = PackedAddressType.ROUTINE):
+        shift = 1 if self.version <= 3 else 2
+        offset = 0
+        if self.version >= 6:
+            if addr_type == PackedAddressType.ROUTINE:
+                offset = self.config.routine_offset
+            elif addr_type == PackedAddressType.STRING:
+                offset = self.config.strings_offset
+        return (packed_addr << shift) + offset
+
+    def read_byte(self, ptr):
+        return self.memory_map.read_byte(ptr)
+
+    def read_word(self, ptr):
+        return self.memory_map.read_word(ptr)
+
+    @property
+    def eval_stack(self) -> 'EvalStack':
+        return self.call_stack.eval_stack
+
+    def stack_push(self, val):
+        self.eval_stack.push(val)
+
+    def stack_pop(self) -> int:
+        return self.eval_stack.pop()
+
+    def stack_peek(self) -> int:
+        return self.eval_stack.peek()
+
+    def get_global_var(self, index):
+        if index < 0 or index >= 0xf0:
+            raise Exception(f"Invalid global variable index: {index}")
+        addr = self.config.global_vars_table_addr + index * 2
+        return self.read_word(addr)
+
+    def set_global_var(self, index, val):
+        if index < 0 or index >= 0xf0:
+            raise Exception(f"Invalid global variable index: {index}")
+        addr = self.config.global_vars_table_addr + index * 2
+        self.write_word(addr, val)
+
+    def read_var(self, varnum):
+        if varnum == 0:
+            return self.stack_pop()
+        elif 0x1 <= varnum <= 0xf:
+            # Local vars
+            return self.call_stack.get_local_var(varnum - 1)
+        elif 0x10 <= varnum <= 0xff:
+            # Global vars
+            return self.get_global_var(varnum - 0x10)
+        else:
+            raise VariableOutOfRangeException(varnum)
+
+    def write_var(self, varnum, val):
+        val &= 0xffff
+        if varnum == 0:
+            self.stack_push(val)
+        elif 0x1 <= varnum <= 0xf:
+            self.call_stack.set_local_var(varnum - 1, val)
+        elif 0x10 <= varnum <= 0xff:
+            self.set_global_var(varnum - 0x10, val)
+        else:
+            raise VariableOutOfRangeException(varnum)
+
+    def do_routine(self, routine_addr: int, args: tuple[int, ...], routine_type: int = RoutineType.STORE):
+        store_varnum = 0
+        if routine_type == RoutineType.STORE:
+            store_varnum = self.read_from_pc()
+        return_pc = self.pc
+        self.pc = routine_addr
+        num_locals = self.read_from_pc()
+        if num_locals > 15:
+            raise InvalidMemoryException('Invalid call to address {0:x}'.format(routine_addr))
+        local_vars = [0] * num_locals
+        for i in range(num_locals):
+            local = 0
+            if self.version <= 4:
+                local = self.read_from_pc(2)
+            if len(args) > i:
+                local = args[i]
+            local_vars[i] = local
+        self.call_stack.push(
+            return_pc=return_pc,
+            store_varnum=store_varnum,
+            local_vars=local_vars,
+            arg_count=len(args),
+            routine_type=routine_type
+        )
+
+    def do_return(self, retval: int):
+        stack_frame = self.call_stack.pop()
+        store_varnum = stack_frame.store_varnum
+        return_pc = stack_frame.return_pc
+        routine_type = stack_frame.routine_type
+        self.pc = return_pc
+        if routine_type == RoutineType.STORE:
+            self.write_var(store_varnum, retval)
+        elif routine_type == RoutineType.DIRECT_CALL:
+            self.stack_push(retval)
+
+    def do_direct_call(self, routine_addr: int) -> int:
+        """
+        Make a direct call to a routine.
+        """
+        if routine_addr == 0:
+            return True
+        frame_id = self.call_stack.catch()
+        self.do_routine(routine_addr, (), RoutineType.DIRECT_CALL)
+        while self.call_stack.catch() > frame_id:
+            self.run_instruction()
+        if self.call_stack.catch() != frame_id:
+            return 1
+        return self.stack_pop()
+
+    def get_arg_count(self) -> int:
+        return self.call_stack.current_frame.arg_count
+    
+    def do_catch(self):
+        frame_id = self.call_stack.catch()
+        self.do_store(frame_id)
+    
+    def do_throw(self, return_value: int, frame_id: int):
+        self.call_stack.throw(frame_id)
+        self.do_return(return_value)
+
+    def do_store(self, value: int):
+        store = self.read_from_pc()
+        self.write_var(store, value)
+
+    def do_branch(self, is_truthy: int):
+        is_true = is_truthy not in (0, False)
+        branch = self.read_from_pc()
+        jump_cond = branch & 0x80 == 0x80
+        offset = branch & 0x3f
+        if branch & 0x40 == 0:
+            offset = ZMachineInterpreter.sign_uint14(offset << 8 | self.read_from_pc())
+        if is_true == jump_cond:
+            if offset in (0, 1):
+                self.do_return(offset)
+            else:
+                self.do_jump(offset)
+
+    def do_jump(self, offset: int):
+        # If a branch offset is 0 or 1, then the branch should return that value from the current routine.
+        # Since the game might make use of an offset of 0 or 1 (ignore the branch or skip over a 1 byte
+        # instruction), encoded offsets add 2 to the actual offset value.
+        # Branch offsets can never be -1 or -2 with this scheme, but doing this would put the program counter
+        # back inside the same instruction and result in bad consequences.
+        self.pc += offset - 2
+
+    def get_object_text(self, obj_id: int) -> str:
+        zchars = self.object_table.get_object_text_zchars(obj_id)
+        return self.text_utils.zscii_decode(zchars)
+
+    def do_read(self, text_buffer_addr: int, parse_buffer_addr: int, time: int = 0, routine: int = 0):
+        timeout_ms = time * 100
+        interrupt_routine_addr = self.unpack_addr(routine)
+        max_text_buffer_size = self.read_byte(text_buffer_addr)
+        if max_text_buffer_size < 3:
+            raise Exception("Fatal error: text buffer length less than 3")
+        self.text_buffer[:] = [0] * len(self.text_buffer)
+        if self.version >= 5:
+            initial_size = self.read_byte(text_buffer_addr + 1)
+            for i in range(initial_size):
+                buffer_char = self.read_byte(text_buffer_addr + i + 2)
+                if buffer_char == 0:
+                    break
+                self.text_buffer[i] = self.read_byte(text_buffer_addr + i + 2)
+        text_addr_offset = 1 if self.version <= 4 else 2
+        current_pc = self.pc
+        self.input_source.read_input(timeout_ms=timeout_ms,
+                                     text_buffer=self.text_buffer,
+                                     interrupt_routine_caller=self.do_direct_call,
+                                     interrupt_routine_addr=interrupt_routine_addr,
+                                     echo=True)
+        # For version 4 or lower, write the characters from the input buffer (without the
+        # terminating character) from byte 1 onwards in the text buffer, followed by a 0 byte.
+        # For version 5+, write the number of typed characters in byte 1, followed by the character
+        # bytes. Store the terminating character.
+        input_len = self.text_buffer.index(0) if 0 in self.text_buffer else len(self.text_buffer)
+        input_len = min(input_len, max_text_buffer_size)
+        input_chars = self.text_buffer[:input_len]
+        terminating_char = 0 if input_len == 0 else input_chars[-1]
+        for i in range(input_len - 1):
+            self.write_byte(text_buffer_addr + text_addr_offset + i, input_chars[i])
+        if self.version <= 4:
+            self.write_byte(text_buffer_addr + max(input_len, 1), 0)
+        else:
+            self.write_byte(text_buffer_addr + 1, max(input_len - 1, 0))
+            # A terminating char of 0 means the read timed out.
+            # It's possible that a direct call has reset the PC and call stack through a
+            # restart or a restore.
+            # Only do the store operation in this case if the PC hasn't moved.
+            if terminating_char != 0 or self.pc == current_pc:
+                self.do_store(terminating_char)
+        if terminating_char == 13:
+            command = bytearray(self.text_buffer[:input_len - 1]).decode()
+            self.parse_command(command, parse_buffer_addr)
+
+    def do_read_char(self, time: int = 0, routine: int = 0):
+        text_buffer = [0]
+        self.input_source.read_input(timeout_ms = time * 100,
+                                     text_buffer=text_buffer,
+                                     interrupt_routine_caller=self.do_direct_call,
+                                     interrupt_routine_addr=self.unpack_addr(routine),
+                                     echo=False)
+        self.do_store(text_buffer[0])
+
+    def do_tokenize(self, text_addr: int, parse_buffer: int, dictionary_addr: int = 0, flag: int = 0):
+        text_length = self.read_byte(text_addr + 1)
+        text_buffer = [0] * text_length
+        for i in range(text_length):
+            text_buffer[i] = self.read_byte(text_addr + i + 2)
+        text = str(bytes(text_buffer), encoding='utf-8')
+        self.parse_command(text, parse_buffer, dictionary_addr, flag)
+
+    def parse_command(self, command: str, parse_buffer: int, dictionary_addr: int = 0, flag: int = 0):
+        if parse_buffer == 0:
+            if self.version < 5:
+                raise Exception("Invalid parse buffer address")
+            return
+        separators = self.text_utils.separator_chars
+        tokens, positions = self.text_utils.tokenize(command, separators)
+        text_buffer_offset = 1 if self.version <= 4 else 2
+        max_words = self.read_byte(parse_buffer)
+        if max_words < 1:
+            raise Exception("Fatal error: parser buffer length less than 6 bytes")
+        self.write_byte(parse_buffer + 1, min(max_words, len(tokens)))
+        parse_ptr = parse_buffer + 2
+        for token, position in zip(tokens[:max_words], positions[:max_words]):
+            dictionary_ptr = self.text_utils.lookup_dictionary(token, dictionary_addr)
+            # If the flag has been set (by the tokenize op), ignore unknown tokens.
+            if dictionary_ptr != 0 or flag == 0:
+                self.write_word(parse_ptr, dictionary_ptr)
+                self.write_byte(parse_ptr + 2, len(token))
+                self.write_byte(parse_ptr + 3, position + text_buffer_offset)
+            parse_ptr += 4
+
+    def do_encode_text(self, text_addr: int, length: int, start: int, coded_buffer: int):
+        text = ['\0'] * length
+        for i in range(length):
+            text[i] = chr(self.read_byte(text_addr + start + i))
+        # This is a version 5+ op, so encoded zscii strings will be 6 bytes.
+        byte_len = 6
+        encoded = self.text_utils.zscii_encode(str.join('', text), byte_len)
+        for i in range(byte_len):
+            self.write_byte(coded_buffer + i, encoded[i])
+
+    def do_select_output_stream(self, stream_id: int, table_addr: int = 0, buffering: bool = False, width: int = 0):
+        interpreter_logger.info(f"Selecting output stream {stream_id}")
+        if stream_id == OutputStreamType.SCREEN:
+            self.output_manager.screen_stream.open()
+        elif -stream_id == OutputStreamType.SCREEN:
+            self.output_manager.screen_stream.close()
+        elif stream_id == OutputStreamType.TRANSCRIPT:
+            self.output_manager.transcript_stream.open()
+        elif -stream_id == OutputStreamType.TRANSCRIPT:
+            self.output_manager.transcript_stream.close()
+        elif stream_id == OutputStreamType.MEMORY:
+            if buffering:
+                # This means the game wants to justify text for a given width (V6)
+                # If the given width is zero or positive, justify the text for a window with that number.
+                # Otherwise, justify for a box -width pixels wide.
+                if width >= 0:
+                    window_id = width
+                    width_pixels = self.screen.get_window_width(window_id)
+                else:
+                    window_id = ACTIVE_WINDOW_ID
+                    width_pixels = -width
+                width = width_pixels // max(self.screen.get_font_width(window_id), 1)
+            self.output_manager.memory_stream.open(table_addr, buffering, width)
+        elif -stream_id == OutputStreamType.MEMORY:
+            self.output_manager.memory_stream.close()
+        self.event_manager.on_select_output_stream.invoke(self, EventArgs())
+
+    def do_sound_effect(self, number: int, effect: int = 0, volume: int = 0, routine: int = 0):
+        volume_level = self.sign_uint8(volume & 0xff)
+        repeats = 0 if self.version <= 3 else self.sign_uint8(volume >> 8)
+        callback_addr = self.unpack_addr(routine)
+        if number >= 3 and repeats == 0 and self.version >= 5:
+            # Per the notes for the sound_effect opcode: setting repeats to 0 is illegal
+            # in V5. This interpreter will treat as a request to play the sound once.
+            logger.warning("Repeats set to 0 for V5 sound effect- interpreter setting repeats to 1")
+            repeats = 1
+        self.screen.sound_effect(number, effect, volume_level, repeats, callback_addr)
+
+    def do_get_picture_data(self, number: int, array: int):
+        resource_data = self.screen.resource_data
+        if number == 0:
+            self.write_word(array, resource_data.picture_count)
+            self.write_word(array + 2, resource_data.release_number)
+            self.do_branch(resource_data.picture_count > 0)
+        elif resource_data.is_valid_picture(number):
+            width, height = self.screen.get_picture_size(number)
+            self.write_word(array, height)
+            self.write_word(array + 2, width)
+            self.do_branch(True)
+        else:
+            self.do_branch(False)
+
+    def write_to_output_streams(self, text, newline=False):
+        self.output_manager.write_to_streams(text, newline)
+
+    def print_from_pc(self, newline=False):
+        self.pc = self.print_from_addr(self.pc, newline)
+
+    def print_from_addr(self, addr, newline=False):
+        zchars: list[int] = []
+        addr = self.text_utils.read_zchars(addr, zchars)
+        text = self.text_utils.zscii_decode(zchars)
+        self.write_to_output_streams(text, newline)
+        return addr
+
+    def do_print_table(self, addr: int, width: int, height: int, skip: int):
+        table = [''] * height
+        row = [0] * width
+        for i in range(height):
+            for j in range(width):
+                row[j] = self.read_byte(addr + j)
+            row_length = row.index(0) if 0 in row else width
+            table[i] = str(bytes(row[:row_length]), encoding='utf-8')
+            addr += width + skip
+        self.screen.print_table(table)
+
+    def string_from_addr(self, addr: int) -> str:
+        zchars: list[int] = []
+        self.text_utils.read_zchars(addr, zchars)
+        return self.text_utils.zscii_decode(zchars)

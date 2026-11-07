@@ -1,0 +1,215 @@
+import os
+from enum import Enum
+from typing import BinaryIO
+
+from .config import ZMachineConfig
+from .constants import IFF_HEADER, IFZS_ID
+from .logging import quetzal_logger
+from .memory import MemoryMap
+from .protocol import ISerializable, ITerminalAdapter
+
+
+class IffType(Enum):
+    HEADER = 'IFhd'
+    COMPRESSED_MEMORY = 'CMem'
+    CALL_STACK = 'Stks'
+    
+
+class Quetzal:
+    def __init__(self, memory_map: MemoryMap, config: ZMachineConfig, terminal_adapter: ITerminalAdapter):
+        self.config = config
+        self.memory_map = memory_map
+        self.terminal_adapter = terminal_adapter
+        self.game_file = self.config.game_file
+        filename = os.path.basename(self.game_file)
+        base_filename = os.path.splitext(filename)[0]
+        self.filepath = os.path.dirname(self.game_file)
+        self.save_file = f'{base_filename}.sav'
+
+    def read_byte(self, addr):
+        return self.memory_map.read_byte(addr)
+
+    def read_word(self, addr):
+        return self.memory_map.read_word(addr)
+
+    def write_word(self, addr, val):
+        self.memory_map.write_word(addr, val)
+
+    def do_save(self, pc: int, call_stack: ISerializable) -> bool:
+        save_file = self.prompt_save_file()
+        save_full_path = os.path.join(self.filepath, save_file)
+        if os.path.exists(save_full_path):
+            if self.interpreter_prompt('Overwrite existing file? (Y is affirmative) ', True) != 'y':
+                return False
+        data_len = len(IFZS_ID)
+        header_data = self.config.release_number[:]
+        header_data += self.config.serial_number
+        header_data += self.config.checksum.to_bytes(2, "big")
+        header_data += pc.to_bytes(3, "big")
+        header_chunk = IffChunk(IffType.HEADER, header_data)
+        dynamic_memory = self.compress_dynamic_memory()
+        mem_chunk = IffChunk(IffType.COMPRESSED_MEMORY, dynamic_memory)
+        stack_data = call_stack.serialize()
+        if len(stack_data) == 0:
+            return False
+        stack_chunk = IffChunk(IffType.CALL_STACK, stack_data)
+        for chunk in (header_chunk, mem_chunk, stack_chunk):
+            data_len += len(chunk)
+        try:
+            with open(save_full_path, 'wb') as s:
+                s.write(IFF_HEADER)
+                s.write(data_len.to_bytes(4, "big"))
+                s.write(IFZS_ID)
+                header_chunk.write(s)
+                mem_chunk.write(s)
+                stack_chunk.write(s)
+            self.save_file = save_file
+            return True
+        except Exception as err:
+            quetzal_logger.warning(f"Error occurred while saving game: {err}")
+            return False
+
+    def do_restore(self, call_stack: ISerializable) -> tuple[int, bool]:
+        """Returns a tuple with the new program counter and a boolean indicating success."""
+        pc = 0
+        flags2_bits = self.read_word(0x10) & 0x3
+        filepath = os.path.dirname(self.game_file)
+        save_file = self.prompt_save_file()
+        save_full_path = os.path.join(filepath, save_file)
+        if not os.path.exists(save_full_path):
+            return (pc, False)
+        chunks: dict[str, IffChunk] = {}
+        try:
+            with open(save_full_path, 'rb') as s:
+                header = s.read(4)
+                data_len = int.from_bytes(s.read(4), "big")
+                form_type = s.read(4)
+                if header != IFF_HEADER or form_type != IFZS_ID:
+                    self.write_to_screen('Invalid save file!', True)
+                    return (pc, False)
+                bytes_read = 8
+                while bytes_read < data_len:
+                    chunk = IffChunk.read(s)
+                    bytes_read += len(chunk)
+                    chunks[chunk.header] = chunk
+            header_chunk = chunks[IffType.HEADER.value]
+            mem_chunk = chunks[IffType.COMPRESSED_MEMORY.value]
+            stack_chunk = chunks[IffType.CALL_STACK.value]
+            release_number = header_chunk.data[0:2]
+            serial_number = header_chunk.data[2:8]
+            checksum = int.from_bytes(header_chunk.data[8:10], "big")
+            pc = int.from_bytes(header_chunk.data[10:13], "big")
+            encoded_memory = mem_chunk.data
+        except Exception as err:
+            quetzal_logger.warning(f"Error occurred while restoring game: {err}")
+            return (pc, False)
+        if release_number != self.config.release_number or \
+                serial_number != self.config.serial_number or \
+                checksum != self.config.checksum:
+            self.write_to_screen("Invalid save file!", True)
+            return (pc, False)
+        dynamic_mem = self.uncompress_dynamic_memory(encoded_memory)
+        self.memory_map.reset_dynamic_memory(dynamic_mem)
+        call_stack.deserialize(stack_chunk.data)
+
+        # Set the transcribe and fixed pitch bits to the previous state.
+        flags2 = self.read_word(0x10)
+        flags2 &= 0xfffc
+        flags2 |= flags2_bits
+        self.write_word(0x10, flags2)
+        return (pc, True)
+
+    # There's no need to compress the dynamic memory for the save file
+    # as modern computers have plenty of storage space.
+    # This method (from Bryan Scattergood) is more interesting and elegant.
+    # The main idea is to exclusive-or each byte of the dynamic memory with
+    # the byte in the original game file. If the result is zero (not changed),
+    # write a zero byte followed by the number of zero bytes (i.e. the number
+    # of bytes we can skip when restoring the dynamic memory).
+    # Otherwise, write the result of the exclusive or.
+    def compress_dynamic_memory(self) -> bytes:
+        static_mem_ptr = self.config.static_memory_base_addr
+        result = [0] * static_mem_ptr
+        result_ptr = 0
+        with open(self.game_file, "rb") as s:
+            dynamic_mem = bytearray(s.read(static_mem_ptr))
+        zero_count = 0
+        for ptr in range(static_mem_ptr):
+            story = self.read_byte(ptr)
+            original = dynamic_mem[ptr]
+            val = story ^ original
+            if val == 0:
+                zero_count += 1
+            else:
+                while zero_count > 0:
+                    result[result_ptr + 1] = min(zero_count - 1, 0xff)
+                    zero_count = max(zero_count - 0x100, 0)
+                    result_ptr += 2
+                result[result_ptr] = val
+                result_ptr += 1
+        return bytes(result[:result_ptr])
+
+    def uncompress_dynamic_memory(self, encoded_memory) -> bytes:
+        static_mem_ptr = self.config.static_memory_base_addr
+        with open(self.game_file, 'rb') as s:
+            dynamic_mem = bytearray(s.read(static_mem_ptr))
+        mem_ptr = 0
+        byte_ptr = 0
+        while byte_ptr < len(encoded_memory):
+            val = encoded_memory[byte_ptr]
+            if val == 0:
+                mem_ptr += encoded_memory[byte_ptr + 1]
+                byte_ptr += 2
+            else:
+                dynamic_mem[mem_ptr] ^= val
+                byte_ptr += 1
+            mem_ptr += 1
+        return dynamic_mem
+
+    def prompt_save_file(self):
+        self.write_to_screen('Enter a file name.', True)
+        save_file = self.interpreter_prompt(f'Default is "{self.save_file}": ')
+        if save_file == '':
+            save_file = self.save_file
+        else:
+            self.save_file = save_file
+        return save_file
+    
+    def write_to_screen(self, text, newline=False):
+        """Print text directly to the screen."""
+        self.terminal_adapter.write_to_screen(text)
+        if newline:
+            self.terminal_adapter.write_to_screen('\n')
+
+    def interpreter_prompt(self, prompt: str, lowercase: bool = False) -> str:
+        """Prompt the user for input and return the result."""
+        return self.terminal_adapter.get_input_string(prompt, lowercase)
+
+class IffChunk:
+    def __init__(self, header: IffType, data: bytes):
+        self.header = header.value[:4]
+        self.data = data
+
+    @classmethod
+    def read(cls, stream: BinaryIO) -> 'IffChunk':
+        header = ''.join([chr(b) for b in stream.read(4)])
+        count = int.from_bytes(stream.read(4), "big")
+        data = stream.read(count)
+        # Pad byte.
+        if count & 1 == 1:
+            stream.read(1)        
+        return cls(IffType(header), data)
+
+    def write(self, stream: BinaryIO):
+        header_bytes = bytes([ord(c) for c in self.header])
+        bytes_written = stream.write(header_bytes)
+        if bytes_written < 4:
+            stream.write(b'\x00' * (4 - bytes_written))
+        stream.write(len(self.data).to_bytes(4, "big"))
+        stream.write(self.data)
+        # Pad byte.
+        if len(self.data) & 1 == 1:
+            stream.write(b'\x00')
+
+    def __len__(self):
+        return len(self.data) + 8 + (len(self.data) & 1)
