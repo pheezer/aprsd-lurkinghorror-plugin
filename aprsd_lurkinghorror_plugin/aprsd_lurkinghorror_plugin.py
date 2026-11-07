@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -82,7 +83,13 @@ class GameIdleThread(threads.APRSDThread):
         expired = store.expire_idle(CONF.lurking_horror.session_idle_timeout)
         if expired:
             LOG.info(f"Expired idle Lurking Horror sessions: {expired}")
-        self.wait()
+        # Pace the loop. aprsd's APRSDThread base has no portable sleep helper
+        # across versions (newer has wait(), 4.x does not), so sleep in short
+        # slices and bail early when asked to stop.
+        slept = 0
+        while slept < self.period and not self._should_quit():
+            time.sleep(1)
+            slept += 1
         return True
 
     def _cleanup(self):
