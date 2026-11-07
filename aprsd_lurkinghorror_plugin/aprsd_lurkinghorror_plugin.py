@@ -213,6 +213,19 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
             LOG.error(f"LurkingHorrorPlugin: failed to load story {story!r}: {ex}")
             self.enabled = False
             return
+
+        # Restore per-callsign saved games from disk so players resume where
+        # they left off across daemon/pod restarts. ObjectStoreMixin only reads
+        # the file when load() is called -- nothing else does it for us.
+        try:
+            store = GameSessionStore()
+            store.load()
+            LOG.info(
+                f"LurkingHorrorPlugin: loaded {len(store)} saved game session(s)."
+            )
+        except Exception as ex:  # noqa: BLE001 - a bad save file must not crash startup
+            LOG.error(f"LurkingHorrorPlugin: failed to load saved sessions: {ex}")
+
         self.enabled = True
 
     def create_threads(self):

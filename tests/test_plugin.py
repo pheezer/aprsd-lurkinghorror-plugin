@@ -180,3 +180,30 @@ def test_new_turn_clears_pending_overflow(configured):
         if r == "Nothing more to show.":
             break
     assert r == "Nothing more to show."
+
+
+@requires_story
+def test_saved_game_survives_daemon_restart(configured, tmp_path):
+    """A new plugin instance (simulating a pod/daemon restart) must resume a
+    player's game from disk -- setup() is responsible for load()."""
+    from aprsd_lurkinghorror_plugin.session import GameSessionStore
+
+    configured.enable_save = True
+    configured.save_location = str(tmp_path)
+
+    # Session 1: start a game and move to another room.
+    plugin1 = LurkingHorrorPlugin()
+    plugin1.filter(make_packet("#"))
+    plugin1.filter(make_packet("# go south"))
+
+    # Simulate a restart: drop the singleton so nothing is in memory, exactly
+    # as a fresh process would be. The on-disk JSON is all that remains.
+    GameSessionStore._instance = None
+
+    # Session 2: a brand-new plugin. Its setup() must load the saved session so
+    # a look shows we are still on the Second Floor, not back at the start.
+    plugin2 = LurkingHorrorPlugin()
+    result = plugin2.filter(make_packet("# look"))
+    assert "Second Floor" in " ".join(
+        result if isinstance(result, list) else [result]
+    )
