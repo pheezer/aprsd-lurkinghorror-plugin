@@ -96,6 +96,29 @@ class GameSessionStore(objectstore.ObjectStoreMixin):
             entry["state_b64"] = blob_b64
         self.save()
 
+    def set_overflow(self, callsign: str, chunks: list[str]) -> None:
+        """Store the not-yet-sent reply chunks for a player (for '# more')."""
+        key = sanitize_callsign(callsign)
+        with self.lock:
+            entry = self.data.get(key)
+            if not entry:
+                entry = {"started_at": _now_iso(), "turns": 0}
+                self.data[key] = entry
+            if chunks:
+                entry["overflow"] = list(chunks)
+            else:
+                entry.pop("overflow", None)
+        self.save()
+
+    def peek_overflow(self, callsign: str) -> list[str]:
+        """Return all buffered reply chunks for a player (without clearing)."""
+        key = sanitize_callsign(callsign)
+        with self.lock:
+            entry = self.data.get(key)
+            if not entry:
+                return []
+            return list(entry.get("overflow") or [])
+
     def delete(self, callsign: str) -> None:
         """Drop a player's session entirely (used by the restart command)."""
         key = sanitize_callsign(callsign)

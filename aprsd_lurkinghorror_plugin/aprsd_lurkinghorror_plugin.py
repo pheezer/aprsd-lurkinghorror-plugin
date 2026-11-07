@@ -28,16 +28,17 @@ APRS_MAX_LEN = 67
 _callsign_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
-def chunk_for_aprs(text: str, max_msgs: int, width: int = APRS_MAX_LEN):
-    """Flatten game output and split it into <=width word-boundary chunks.
+DEFAULT_MORE_MARKER = " (more)"
 
-    Returns a single str when it fits in one message (parity with other
-    plugins), else a list[str]. Caps at max_msgs, marking truncation.
+
+def wrap_chunks(text: str, width: int = APRS_MAX_LEN) -> list[str]:
+    """Flatten whitespace and split text into <=width word-boundary chunks.
+
+    No cap and no marker -- this returns ALL chunks, losslessly.
     """
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if not text:
-        return "Ok."
-
+        return []
     chunks: list[str] = []
     current = ""
     for word in text.split(" "):
@@ -57,17 +58,52 @@ def chunk_for_aprs(text: str, max_msgs: int, width: int = APRS_MAX_LEN):
             current = word
     if current:
         chunks.append(current)
+    return chunks
 
+
+def take_batch(
+    chunks: list[str],
+    max_msgs: int,
+    width: int = APRS_MAX_LEN,
+    marker: str = DEFAULT_MORE_MARKER,
+):
+    """Take up to max_msgs chunks to send now; return (to_send, remaining).
+
+    to_send is a bare str for a single chunk (parity with other plugins), else
+    a list[str]. When chunks are left over, the last sent chunk ends with
+    `marker` and -- crucially -- any text displaced to make room for the marker
+    is pushed back onto `remaining` rather than lost, so `# more` can retrieve
+    the full text.
+    """
+    if not chunks:
+        return "Ok.", []
     if len(chunks) <= max_msgs:
-        return chunks[0] if len(chunks) == 1 else chunks
+        return (chunks[0] if len(chunks) == 1 else list(chunks)), []
 
-    kept = chunks[:max_msgs]
-    marker = " (more)"
-    tail = kept[-1]
-    if len(tail) + len(marker) > width:
-        tail = tail[: width - len(marker)].rstrip()
-    kept[-1] = tail + marker
-    return kept
+    batch = list(chunks[:max_msgs])
+    remaining = list(chunks[max_msgs:])
+    last = batch[-1]
+    if len(last) + len(marker) > width:
+        limit = width - len(marker)
+        # Trim at a word boundary when possible; hard-cut a single long word.
+        cut = last.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        kept, dropped = last[:cut].rstrip(), last[cut:].strip()
+        batch[-1] = kept + marker
+        if dropped:
+            remaining = [dropped, *remaining]
+    else:
+        batch[-1] = last + marker
+    return batch, remaining
+
+
+def chunk_for_aprs(text: str, max_msgs: int, width: int = APRS_MAX_LEN):
+    """Convenience: wrap text and return just the first batch to send.
+
+    Kept for callers/tests that don't need the overflow remainder.
+    """
+    return take_batch(wrap_chunks(text, width), max_msgs, width)[0]
 
 
 class GameIdleThread(threads.APRSDThread):
@@ -202,7 +238,8 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
         p = self.prefix
         return (
             f"Play Lurking Horror: '{p} <cmd>' e.g. '{p} go north'. "
-            f"'{p}' alone resumes, '{p} restart' starts over."
+            f"'{p}' resumes, '{p} more' continues long text, "
+            f"'{p} restart' starts over."
         )
 
     def _run_turn(self, state_blob, command):
@@ -227,6 +264,14 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
         store = GameSessionStore()
         lock = _callsign_locks[callsign]
         with lock:
+            # '# more' / '# m': send the next batch of previously-truncated text
+            # instead of running a game turn.
+            if low in ("more", "m"):
+                buffered = store.peek_overflow(callsign)
+                if not buffered:
+                    return "Nothing more to show."
+                return self._emit(callsign, buffered, store)
+
             if low == "restart":
                 store.delete(callsign)
                 command = ""  # fall through to a fresh game intro
@@ -236,6 +281,9 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
             # otherwise start a new one (empty command -> intro only).
             if command == "" and state is not None:
                 command = "look"
+
+            # A new game turn supersedes any pending overflow from a prior one.
+            store.set_overflow(callsign, [])
 
             try:
                 text, new_state = self._run_turn(state, command)
@@ -250,5 +298,13 @@ class LurkingHorrorPlugin(plugin.APRSDRegexCommandPluginBase):
                 return f"Game error: {ex}"
 
             store.record_turn(callsign, new_state)
+            return self._emit(callsign, wrap_chunks(text), store)
 
-        return chunk_for_aprs(text, CONF.lurking_horror.max_reply_messages)
+    def _emit(self, callsign, all_chunks, store):
+        """Send up to max_reply_messages chunks now; buffer the rest for
+        '# more'. If anything is buffered, the last sent line ends with
+        '(more)'."""
+        max_msgs = CONF.lurking_horror.max_reply_messages
+        to_send, remaining = take_batch(all_chunks, max_msgs)
+        store.set_overflow(callsign, remaining)
+        return to_send

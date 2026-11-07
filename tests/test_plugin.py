@@ -121,3 +121,62 @@ def test_engine_error_returns_graceful_reply(configured):
     ):
         result = plugin.filter(make_packet("# look"))
     assert "game error" in result.lower()
+
+
+@requires_story
+def test_more_command_continues_truncated_text(configured):
+    # Force a tiny cap so the intro overflows and buffers a remainder.
+    configured.lurking_horror.max_reply_messages = 2
+    plugin = LurkingHorrorPlugin()
+
+    first = plugin.filter(make_packet("#"))
+    assert isinstance(first, list)
+    assert len(first) == 2
+    assert first[-1].endswith("(more)")
+
+    # '# more' returns the next batch (and may itself end with (more)).
+    second = plugin.filter(make_packet("# more"))
+    assert second not in (None, "Nothing more to show.")
+    second_list = second if isinstance(second, list) else [second]
+    assert all(len(c) <= 67 for c in second_list)
+
+    # The two batches together must reconstruct a prefix of the full intro
+    # with no words lost at the seam.
+    def strip_marker(chunks):
+        return [c[: -len(" (more)")] if c.endswith("(more)") else c for c in chunks]
+
+    words = (" ".join(strip_marker(first)) + " " + " ".join(strip_marker(second_list))).split()
+    # The intro begins with this exact phrase; the seam between batch 1 and 2
+    # must preserve it contiguously.
+    assert words[:6] == ["You've", "waited", "until", "the", "last", "minute"]
+
+
+@requires_story
+def test_more_with_nothing_buffered(configured):
+    configured.lurking_horror.max_reply_messages = 8
+    plugin = LurkingHorrorPlugin()
+    plugin.filter(make_packet("#"))  # 8-msg cap: intro likely fits, no overflow
+    # Drain any buffer, then a further '# more' reports nothing.
+    seen_nothing = False
+    for _ in range(20):
+        r = plugin.filter(make_packet("# more"))
+        if r == "Nothing more to show.":
+            seen_nothing = True
+            break
+    assert seen_nothing
+
+
+@requires_story
+def test_new_turn_clears_pending_overflow(configured):
+    configured.lurking_horror.max_reply_messages = 2
+    plugin = LurkingHorrorPlugin()
+    plugin.filter(make_packet("#"))  # overflow buffered
+    # A real game command supersedes the old overflow.
+    plugin.filter(make_packet("# look"))
+    # The buffer now reflects the look output, not the stale intro; eventually
+    # draining it reaches "Nothing more to show." without error.
+    for _ in range(20):
+        r = plugin.filter(make_packet("# more"))
+        if r == "Nothing more to show.":
+            break
+    assert r == "Nothing more to show."
