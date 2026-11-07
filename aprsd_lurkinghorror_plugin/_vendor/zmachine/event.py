@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Callable, List
+from typing import Any, Callable, Generic, List, TypeVar
 
 
 @dataclass
@@ -24,7 +24,10 @@ class RoutineCallEventArgs(EventArgs):
     routine_addr: int
 
 
-class Event[T: EventArgs]:
+T = TypeVar("T", bound=EventArgs)
+
+
+class Event(Generic[T]):
     def __init__(self):
         self.delegates: List[Callable[[Any, T], None]] = []
 
